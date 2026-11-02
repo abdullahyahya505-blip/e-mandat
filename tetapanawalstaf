@@ -1,0 +1,88 @@
+// Tambah sebagai fail skrip berasingan dalam projek e-MANDAT sedia ada.
+// Jalankan mulaKataLaluanStaf SEKALI melalui editor; tiada deployment diperlukan.
+function mulaKataLaluanStaf() {
+  const aktif = Session.getActiveUser().getEmail();
+  const pelaksana = Session.getEffectiveUser().getEmail();
+  if (!aktif || aktif !== pelaksana) {
+    throw new Error('Jalankan melalui editor Apps Script menggunakan akaun pemilik projek.');
+  }
+
+  return locked_(() => {
+    assertReady_();
+    const props = PropertiesService.getScriptProperties();
+    const penanda = 'EMANDAT_TETAPAN_AWAL_STAF_V1';
+    if (props.getProperty(penanda)) {
+      Logger.log('Tetapan awal sudah selesai sebelum ini. Tiada akaun diubah.');
+      return { ok: true, sudahSelesai: true, diubah: 0 };
+    }
+
+    const ss = ss_();
+    const sh = ss.getSheetByName('PENGGUNA');
+    if (!sh || sh.getLastRow() < 2) throw new Error('Tab PENGGUNA kosong atau tidak ditemui.');
+    const semua = sh.getDataRange().getValues();
+    const kepala = semua[0].map(x => String(x).trim());
+    const perlu = ['ID STAF','PERANAN','SKOP','STATUS','SALT PIN','HASH PIN',
+      'MODUL_AKSES','SIGNATURE','STAMP','GAGAL LOGIN','KUNCI SEHINGGA',
+      'RESET_COUNT','WAJIB TUKAR PIN'];
+    if (!perlu.every((x, i) => kepala[i] === x)) {
+      throw new Error('Struktur PENGGUNA tidak sepadan. Jangan ubah lajur secara manual.');
+    }
+    const teks = x => String(x == null ? '' : x).trim();
+    const idAktif = new Set(masterStaff_().map(p => teks(p.id).toUpperCase()));
+    const lindung = new Set();
+    semua.slice(1).forEach(r => {
+      const id = teks(r[0]).toUpperCase();
+      // Sebarang peranan/modul khas pada mana-mana baris ID ini melindungi semua barisnya.
+      if (id && (teks(r[1]).toUpperCase() !== 'STAF' || teks(r[6]) ||
+          !['AKTIF','MENUNGGU PIN'].includes(teks(r[3]).toUpperCase()))) {
+        lindung.add(id);
+      }
+    });
+
+    const indeks = [];
+    const ids = new Set();
+    semua.slice(1).forEach((r, i) => {
+      const id = teks(r[0]).toUpperCase();
+      if (!id || !idAktif.has(id) || lindung.has(id)) return;
+      if (teks(r[1]).toUpperCase() !== 'STAF' || teks(r[6])) return;
+      if (!['AKTIF','MENUNGGU PIN'].includes(teks(r[3]).toUpperCase())) return;
+      indeks.push(i + 1); ids.add(id);
+    });
+    if (!indeks.length) {
+      Logger.log('Tiada akaun STAF biasa yang layak diubah. Tiada perubahan.');
+      return { ok: true, diubah: 0 };
+    }
+
+    // Sandaran mesti berjaya sebelum sebarang kata laluan diubah.
+    const nama = 'BU_PIN_STAF_' + Utilities.formatDate(new Date(),
+      'Asia/Kuala_Lumpur', 'yyMMdd_HHmmss') + '_' + uuid_().slice(0, 4);
+    const backup = sh.copyTo(ss).setName(nama);
+
+    const julat = sh.getRange(2, 1, semua.length - 1, kepala.length);
+    const formula = julat.getFormulas();
+    const data = semua.slice(1).map((r, i) => r.map((v, j) => formula[i][j] || v));
+    const rahsia = new Map();
+    indeks.forEach(i => {
+      const r = data[i - 1], id = teks(r[0]).toUpperCase();
+      if (!rahsia.has(id)) {
+        const salt = uuid_();
+        rahsia.set(id, { salt: salt, hash: hash_('123456', salt) });
+      }
+      const h = rahsia.get(id);
+      r[3] = 'AKTIF';
+      r[4] = h.salt;
+      r[5] = h.hash;
+      r[9] = 0;
+      r[10] = '';
+      r[12] = 'YA';
+      // ID, peranan, skop, modul, tandatangan, cop dan lajur tambahan dikekalkan.
+    });
+    julat.setValues(data);
+    SpreadsheetApp.flush();
+    props.setProperty(penanda, new Date().toISOString());
+    Logger.log('SELESAI: ' + ids.size + ' akaun STAF ditetapkan kepada kata laluan awal dan wajib tukar.');
+    Logger.log('Sandaran: ' + backup.getName());
+    Logger.log('Pentadbir, akaun bermodul khas dan akaun tidak aktif dikekalkan. Tiada e-mel dihantar.');
+    return { ok: true, diubah: ids.size, barisDiubah: indeks.length, sandaran: backup.getName() };
+  });
+}
