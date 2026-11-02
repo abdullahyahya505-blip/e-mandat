@@ -1,0 +1,776 @@
+// e-MANDAT V6.1 — Pemulihan berdasarkan HTML dan database dibekalkan.
+const CFG = {
+  STAFF_SHEET: 'STAF',
+  RECORD_SHEET: 'KEBERADAAN',
+  DATES: ['2026-10-09','2026-10-12','2026-10-13','2026-10-14','2026-10-15','2026-10-16'],
+  STATUS: ['BDP','BDR','UR','MC','CR','LAIN-LAIN', 'BDR (Sokongan)', 'BDR (Kelulusan)', 'UR (Sokongan)', 'UR (Kelulusan)']
+};
+const CORPORATE_THEMES_V171 = ['navy','burgundy','purple','charcoal'];
+const USER_HEAD = ['ID STAF','PERANAN','SKOP','STATUS','SALT PIN','HASH PIN','MODUL_AKSES','SIGNATURE','STAMP','GAGAL LOGIN','KUNCI SEHINGGA','RESET_COUNT', 'WAJIB TUKAR PIN'];
+
+let executionSpreadsheet_;
+function ss_(){
+  if(executionSpreadsheet_)return executionSpreadsheet_;
+  const id = PropertiesService.getScriptProperties().getProperty('EMANDAT_SHEET_ID');
+  const ss = id ? SpreadsheetApp.openById(id) : SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) throw Error('Tetapkan EMANDAT_SHEET_ID dalam Script Properties.');
+  executionSpreadsheet_=ss;return ss;
+}
+
+function sheet_(name){
+ const sh=ss_().getSheetByName(name);
+ if(!sh) throw Error('Tab '+name+' tiada. Jalankan setupEMandat_ melalui editor.');
+ return sh;
+}
+
+function rows_(sh,width){
+ if(sh.getLastRow()<2)return [];
+ const n=Math.min(width,sh.getLastColumn());
+ return sh.getRange(2,1,sh.getLastRow()-1,n).getValues().map(row=>{
+   const r=row.map(x=>x instanceof Date?Utilities.formatDate(x,'Asia/Kuala_Lumpur','yyyy-MM-dd'):String(x==null?'':x).trim());
+   while(r.length<width)r.push('');return r;
+ });
+}
+
+function setRow_(sh, rIndex, dataArr) {
+  if (!sh) return;
+  const needed = dataArr.length;
+  if (sh.getMaxColumns() < needed) sh.insertColumnsAfter(sh.getMaxColumns(), needed - sh.getMaxColumns());
+  sh.getRange(rIndex, 1, 1, needed).setValues([dataArr]);
+}
+
+function uuid_(){return Utilities.getUuid().replace(/-/g,'');}
+function sha_(value){return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,value,Utilities.Charset.UTF_8).map(b=>('0'+(b&255).toString(16)).slice(-2)).join('');}
+function hash_(secret, salt) {
+  let h = secret + '|' + salt + '|IPGKPM_STABIL_2026';
+  for (let i = 0; i < 20; i++) h = sha_(h);
+  return h;
+}
+
+function verifyPin_(pin,r){
+ if(!r[4] || !r[5] || r[5]==='BYPASS')return false;
+ if(hash_(pin,r[4])===r[5])return true;
+ let h=pin+'|'+r[4]+'|IPGKPM_STABIL_2026';
+ for(let i=0;i<50;i++)h=sha_(h);
+ return h===r[5];
+}
+
+function norm_(x){return String(x||'').trim();}
+function safe_(v){v=norm_(v);return /^[=+@\-\t\r]/.test(v)?"'"+v:v;}
+function getSecret_(str) { return Utilities.newBlob(Utilities.base64Decode(str)).getDataAsString(); }
+
+function doGet(){
+ return HtmlService.createHtmlOutputFromFile('Index').setTitle('e-MANDAT • IPGK PM').addMetaTag('viewport','width=device-width,initial-scale=1');
+}
+
+function userRow_(id){
+  let sh = sheet_('PENGGUNA');
+  if (!sh) return {sh:null, idx:-1, row:null};
+  let rs = rows_(sh,Math.max(13,sh.getLastColumn()));
+  let target = String(id).trim().toUpperCase();
+  let foundIdx = -1;
+  for (let k = rs.length - 1; k >= 0; k--) {
+    if (String(rs[k][0]).trim().toUpperCase() === target) {
+      foundIdx = k;
+      break;
+    }
+  }
+  return {sh, idx: foundIdx < 0 ? -1 : foundIdx + 2, row: foundIdx < 0 ? null : rs[foundIdx]};
+}
+
+function staff_(id){return rows_(sheet_('STAF'),8).filter(r=>r[0]===id && r[6]!=='GUGUR');}
+
+function myToday_(){return Utilities.formatDate(new Date(),'Asia/Kuala_Lumpur','yyyy-MM-dd');}
+function parseDay_(s){return new Date(s+'T12:00:00Z');}
+function monday_(date){const d=parseDay_(date);const dow=d.getUTCDay();d.setUTCDate(d.getUTCDate()-((dow+6)%7));return d.toISOString().slice(0,10);}
+function addDays_(date,n){const d=parseDay_(date);d.setUTCDate(d.getUTCDate()+n);return d.toISOString().slice(0,10);}
+function weekDays_(date){const m=monday_(date);return [0,1,2,3,4].map(i=>addDays_(m,i));}
+
+// LOG MASUK YANG MENGHANTAR PROFIL PENUH & MODUL SEBENAR SERTA-MERTA
+function login(rawId,pin,isAdminLogin){
+ return locked_(()=>{
+  assertReady_();
+  let id=norm_(rawId).toUpperCase();pin=String(pin||'');
+  if(!id||!pin)return {error:'Sila pilih staf dan masukkan kata laluan.'};
+  const obj=userRow_(id),r=obj.row;
+  if(!r || !staff_(id).length)return {error:'Akaun tidak ditemui. Hubungi pentadbir.'};
+  if(!['AKTIF','MENUNGGU PIN'].includes(r[3]))return {error:'Akaun tidak aktif atau sedang menunggu reset.'};
+  if(r[10] && Date.parse(r[10])>Date.now())return {error:'Akaun dikunci sementara. Cuba selepas 15 minit.'};
+  if(!verifyPin_(pin,r)){
+   r[9]=Number(r[9]||0)+1;
+   if(r[9]>=5){r[10]=new Date(Date.now()+15*60000).toISOString();r[9]=0;}
+   setRow_(obj.sh,obj.idx,r);
+   return {error:'Kata laluan tidak sah. Jika kata laluan lama tidak serasi, mohon reset kepada pentadbir.'};
+  }
+  if(isAdminLogin && r[1]==='STAF' && !r[6])return {error:'Akaun ini bukan pentadbir. Gunakan log masuk staf.'};
+  r[9]=0;r[10]='';setRow_(obj.sh,obj.idx,r);
+  if(r[12]==='YA'){
+   const t=uuid_()+uuid_();
+   CacheService.getScriptCache().put('change_'+t,JSON.stringify({id,hash:r[5]}),600);
+   return {mustChangePin:true,changeToken:t};
+  }
+  const token=uuid_()+uuid_();
+  CacheService.getScriptCache().put('sess_'+token,JSON.stringify({id,hash:r[5]}),21600);
+  const user=session_(token);
+  return {token,role:user.role,scope:user.scope,modules:user.modules,user};
+ });
+}
+
+function session_(token){
+ assertReady_();
+ const raw=CacheService.getScriptCache().get('sess_'+norm_(token));
+ if(!raw)throw Error('Sesi tamat. Sila log masuk semula.');
+ const claim=JSON.parse(raw),id=claim.id;
+  const s = staff_(id);
+  if (!s.length) throw Error('Rekod staf tidak ditemui.');
+  const obj = userRow_(id);
+  if(!obj.row || obj.row[3]!=='AKTIF' || obj.row[5]!==claim.hash)throw Error('Sesi tidak sah. Sila log masuk semula.');
+  let role = obj.row && obj.row[1] ? obj.row[1] : 'STAF';
+  let scope = obj.row && obj.row[2] ? obj.row[2] : s[0][2];
+  let modules = obj.row && obj.row[6] ? obj.row[6] : '';
+  
+  let mSet = new Set(modules.split(',').map(x=>x.trim()).filter(Boolean));
+
+  // KETUA JABATAN & KETUA UNIT AUTOMATIK JADI PENYOKONG BDR & UR JABATAN MEREKA
+  if (['KETUA JABATAN', 'KETUA UNIT'].includes(role)) {
+    mSet.add('SOKONG_BDR');
+    mSet.add('SOKONG_UR');
+  }
+
+  // PENGURUSAN (PENGARAH / TIMBALAN PENGARAH) AUTOMATIK DAPAT AKSES WARGA & KELULUSAN JIKA BELUM DITETAPKAN
+  if (role === 'PENGURUSAN') {
+    scope = 'SEMUA';
+    mSet.add('SOKONG_BDR');
+    mSet.add('LULUS_BDR');
+    mSet.add('SOKONG_UR');
+    mSet.add('LULUS_UR');
+    mSet.add('ANALISA');
+    mSet.add('ANALISA_WARGA');
+  }
+
+  modules = [...mSet].join(',');
+  const sign = obj.row ? obj.row[7] : '';
+  const stamp = obj.row ? obj.row[8] : '';
+  
+  return { id, name: s[0][1], role, scope, unit: s[0][2], jawatan: s[0][3], gred: s[0][4], modules, sign, stamp };
+}
+
+function logout(token){CacheService.getScriptCache().remove('sess_'+norm_(token));return true;}
+
+function checkAccess_(u, moduleCode) {
+  if (['SUPER ADMIN HIDDEN', 'SUPER ADMIN'].includes(u.role)) return true;
+  const mods = String(u.modules || '').split(',').map(x => x.trim()).filter(Boolean);
+  if (mods.includes('SEMUA')) return true;
+  if (['KETUA JABATAN', 'KETUA UNIT'].includes(u.role) && ['SOKONG_BDR', 'SOKONG_UR'].includes(moduleCode)) return true;
+  if (u.role === 'PENGURUSAN' && ['SOKONG_BDR', 'LULUS_BDR', 'SOKONG_UR', 'LULUS_UR', 'ANALISA', 'ANALISA_WARGA'].includes(moduleCode)) return true;
+  if (moduleCode === 'ANALISA' && mods.includes('ANALISA_WARGA')) return true;
+  return mods.includes(moduleCode);
+}
+
+// SKOP DATA DASHBOARD & ANALISA (SOKONG ANALISA KESELURUHAN WARGA & JABATAN)
+function within_(u, p) {
+  if (['SUPER ADMIN HIDDEN', 'SUPER ADMIN', 'PENGURUSAN'].includes(u.role)) return true;
+  const mods = String(u.modules || '').split(',').map(x => x.trim());
+  // Jika Admin diberi lencana ANALISA_WARGA atau LULUS_BDR / LULUS_UR atau skop SEMUA, benarkan lihat keseluruhan warga & jabatan
+  if (u.scope === 'SEMUA' || mods.includes('ANALISA_WARGA') || mods.includes('LULUS_BDR') || mods.includes('LULUS_UR') || mods.includes('DB') || mods.includes('ROLE')) {
+    return true;
+  }
+  if (['KETUA JABATAN', 'KETUA UNIT', 'ADMIN'].includes(u.role) || mods.includes('ANALISA') || mods.includes('SOKONG_BDR') || mods.includes('SOKONG_UR')) {
+    const targetUnit = (u.scope && u.scope !== 'SEMUA') ? u.scope : u.unit;
+    return p.unit === targetUnit || p.unit === u.unit;
+  }
+  return p.id === u.id;
+}
+
+function changeUserPassword(changeToken,oldPass,newPass,confirmPass){
+ return locked_(()=>{
+  assertReady_();const cache=CacheService.getScriptCache(),key='change_'+norm_(changeToken),raw=cache.get(key);
+  if(!raw)throw Error('Pautan tukar kata laluan tamat. Log masuk semula.');
+  const claim=JSON.parse(raw),obj=userRow_(claim.id),r=obj.row;
+  if(!r || r[5]!==claim.hash || !['AKTIF','MENUNGGU PIN'].includes(r[3]) || !verifyPin_(String(oldPass||''),r))throw Error('Kata laluan semasa tidak sah.');
+  newPass=String(newPass||'');
+  if(newPass!==String(confirmPass||'') || newPass.length<6 || newPass===String(oldPass))throw Error('Gunakan kata laluan baharu sekurang-kurangnya 6 aksara dan pengesahan yang sama.');
+  r[4]=uuid_();r[5]=hash_(newPass,r[4]);r[12]='TIDAK';r[3]='AKTIF';r[9]=0;r[10]='';
+  setRow_(obj.sh,obj.idx,r);cache.remove(key);return {ok:true};
+ });
+}
+
+function userRequestReset(id){
+ return locked_(()=>{
+  assertReady_();const obj=userRow_(norm_(id).toUpperCase());
+  if(!obj.row || !['AKTIF','MENUNGGU PIN','MOHON RESET'].includes(obj.row[3]))throw Error('Akaun tidak tersedia. Hubungi pentadbir.');
+  // A public reset request never suspends an account or changes its password.
+  const sh=sheet_('PERMOHONAN');
+  if(!rows_(sh,7).some(r=>r[0]===obj.row[0] && r[4]==='MENUNGGU')){
+   const st=staff_(obj.row[0])[0];sh.appendRow([obj.row[0],st[1],st[2],new Date(),'MENUNGGU','','']);
+  }return {ok:true};
+ });
+}
+
+function saveProfileImage(token,type,base64){
+ return locked_(()=>{
+  const u=session_(token);
+  if(!['SIGN','STAMP'].includes(type)||typeof base64!=='string'||base64.length>45000||!/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(base64))throw Error('Gunakan imej PNG/JPEG/WebP di bawah 33 KB selepas pemampatan.');
+  const o=userRow_(u.id);o.row[type==='SIGN'?7:8]=base64;setRow_(o.sh,o.idx,o.row);return {ok:true};
+ });
+}
+
+function getData(token){
+  const u = session_(token);
+  let rawStaf = masterStaff_().map(p=>({id:p.id,name:p.name,unit:p.unit,jawatan:p.jawatan}));
+  try {
+    const shStaf = sheet_('STAF');
+    if (shStaf && shStaf.getLastRow() >= 2) {
+      const dbStaf = rows_(shStaf, 7).filter(r=>r[0]&&r[1]&&r[6]!=='GUGUR').map(r=>({id:r[0],name:r[1],unit:r[2],jawatan:r[3]}));
+      if (dbStaf.length > 0) rawStaf = dbStaf;
+    }
+  } catch(e) {}
+
+  const people = rawStaf.filter(p=>within_(u,p));
+  const ids = new Set(people.map(p=>p.id));
+  let entries = [];
+  try {
+    entries = rows_(sheet_('KEBERADAAN'),6).filter(r=>ids.has(r[0])&&r[1]).map(r=>({id:r[0],date:r[1],status:r[2],note:r[3]}));
+  } catch(e) {}
+  
+  let totalResets = 0;
+  try {
+    if(checkAccess_(u, 'ANALISA') || checkAccess_(u, 'ANALISA_WARGA') || ['KETUA JABATAN','KETUA UNIT'].includes(u.role)) {
+       const users = rows_(sheet_('PENGGUNA'), 13);
+       users.forEach(r => { totalResets += Number(r[11] || 0); }); 
+    }
+  } catch(e) {}
+
+  return {
+    user: u,
+    people: people,
+    entries: entries,
+    dates: weekDays_(myToday_()),
+    weekStart: monday_(myToday_()),
+    statuses: CFG.STATUS,
+    units: [...new Set(people.map(p=>p.unit))].sort(),
+    totalResets: totalResets
+  };
+}
+
+function saveStatus(payload,token){
+ return locked_(()=>{
+  const u=session_(token),p=payload||{},id=norm_(p.id),date=validDay_(p.date),status=norm_(p.status);
+  canEditRecord_(u,id);
+  if(!CFG.STATUS.includes(status)||/Sokongan|Kelulusan/.test(status))throw Error('Status tidak sah.');
+  if(['BDR','UR'].includes(status)){
+   const sh=sheet_(status==='BDR'?'BORANG_BDR':'BORANG_UR'),b=status==='BDR',rs=rows_(sh,b?20:23);
+   if(!rs.some(r=>r[2]===id && date>=r[b?7:8] && date<=r[b?8:9] && r[b?16:19]==='DILULUSKAN'))throw Error('Hantar borang '+status+' dan tunggu kelulusan dahulu.');
+  }
+  upsertRecord_(id,date,status,safe_(norm_(p.note)),u.id);return {ok:true};
+ });
+}
+
+function adminDeleteKeberadaan(token,targetId,targetDate){
+ return locked_(()=>{
+  const u=session_(token),id=norm_(targetId),dt=validDay_(targetDate);canEditRecord_(u,id);
+  const sh=sheet_('KEBERADAAN'),rs=rows_(sh,6);
+  for(let i=rs.length-1;i>=0;i--)if(rs[i][0]===id&&rs[i][1]===dt)sh.deleteRow(i+2);
+  // Approval forms remain as the audit record; deleting one day never deletes a multi-day form.
+  return {ok:true};
+ });
+}
+
+function submitBorangBDR(token, p) {
+  return locked_(()=>{
+  const u = session_(token);
+  validateForm_(u,p,"BDR");
+  const sh = sheet_('BORANG_BDR');
+ const reqId = 'BDR-' + uuid_(), tMohon = Utilities.formatDate(new Date(), 'Asia/Kuala_Lumpur', 'yyyy-MM-dd HH:mm:ss');
+  sh.appendRow([ reqId, tMohon, u.id, u.name, u.unit, u.jawatan, u.gred, p.mula, p.akhir, p.telefon, p.sebab, p.alamat, 'MENUNGGU SOKONGAN', '', '', '', 'MENUNGGU KELULUSAN', '', '', '' ]);
+  
+  const recSh = sheet_('KEBERADAAN'), rs = rows_(recSh, 6);
+  let curr = p.mula;
+  while(curr <= p.akhir) {
+    const dow = new Date(curr+'T12:00:00Z').getUTCDay();
+    if (dow >= 1 && dow <= 5) {
+      const ix = rs.findIndex(r => r[0] === u.id && r[1] === curr), v = [u.id, curr, 'BDR (Sokongan)', 'Rujuk Borang BDR: ' + reqId, new Date(), u.id];
+      if (ix === -1) recSh.appendRow(v); else setRow_(recSh, ix+2, v);
+    }
+    curr = addDays_(curr, 1);
+  }
+  return { ok: true, reqId: reqId };
+  });
+}
+
+function submitBorangUR(token, p) {
+  return locked_(()=>{
+  const u = session_(token);
+  validateForm_(u,p,"UR");
+  const sh = sheet_('BORANG_UR');
+ const reqId = 'UR-' + uuid_(), tMohon = Utilities.formatDate(new Date(), 'Asia/Kuala_Lumpur', 'yyyy-MM-dd HH:mm:ss');
+  sh.appendRow([ reqId, tMohon, u.id, u.name, u.unit, u.jawatan, u.gred, p.perihal, p.mula, p.akhir, p.lokasi, p.tempatLuar, p.rujukan, p.tarikhSurat, p.diminitkan, 'MENUNGGU SOKONGAN', '', '', '', 'MENUNGGU KELULUSAN', '', '', '' ]);
+  
+  const recSh = sheet_('KEBERADAAN'), rs = rows_(recSh, 6);
+  let curr = p.mula;
+  while(curr <= p.akhir) {
+    const dow = new Date(curr+'T12:00:00Z').getUTCDay();
+    if (dow >= 1 && dow <= 5) {
+      const ix = rs.findIndex(r => r[0] === u.id && r[1] === curr), v = [u.id, curr, 'UR (Sokongan)', 'Rujuk UR: ' + reqId, new Date(), u.id];
+      if (ix === -1) recSh.appendRow(v); else setRow_(recSh, ix+2, v);
+    }
+    curr = addDays_(curr, 1);
+  }
+  return { ok: true, reqId: reqId };
+  });
+}
+
+function getMyForms(token) {
+  const u = session_(token);
+  const bdrSh = sheet_('BORANG_BDR');
+  const urSh = sheet_('BORANG_UR');
+  let myBDR = [], myUR = [];
+  
+  if (bdrSh) {
+     myBDR = rows_(bdrSh, 20).filter(r => r[2] === u.id).map(r => ({
+      reqId: r[0], tMohon: r[1], name: r[3], unit: r[4], jawatan: r[5], gred: r[6], mula: r[7], akhir: r[8], telefon: r[9], sebab: r[10], alamat: r[11],
+      statusSokong: r[12], idSokong: r[13], ulasanSokong: r[14], tSokong: r[15], statusLulus: r[16], idLulus: r[17], ulasanLulus: r[18], tLulus: r[19]
+    })).reverse(); 
+  }
+  if (urSh) {
+     myUR = rows_(urSh, 23).filter(r => r[2] === u.id).map(r => ({
+      reqId: r[0], tMohon: r[1], name: r[3], unit: r[4], jawatan: r[5], gred: r[6], perihal: r[7], mula: r[8], akhir: r[9], lokasi: r[10], tempatLuar: r[11], rujukan: r[12], tarikhSurat: r[13], diminitkan: r[14],
+      statusSokong: r[15], idSokong: r[16], ulasanSokong: r[17], tSokong: r[18], statusLulus: r[19], idLulus: r[20], ulasanLulus: r[21], tLulus: r[22]
+    })).reverse();
+  }
+  
+  const userDB = rows_(sheet_('PENGGUNA'), 13);
+  const sigMap = new Map(userDB.map(r => [r[0], {sign: r[7], stamp: r[8]}]));
+  const stafDetails = new Map(masterStaff_().map(s => [s.id, {nama: s.name, jwt: s.jawatan+' '+s.gred}]));
+
+  const injectSig = (form) => {
+     form.mySign = sigMap.get(u.id)?.sign || '';
+     if (form.statusSokong === 'DISOKONG' && form.idSokong) { 
+       form.sokongSign = sigMap.get(form.idSokong)?.sign || ''; form.sokongStamp = sigMap.get(form.idSokong)?.stamp || ''; 
+       form.namaSokong = stafDetails.get(form.idSokong)?.nama || form.idSokong; form.jwtSokong = stafDetails.get(form.idSokong)?.jwt || '';
+     }
+     if (form.statusLulus === 'DILULUSKAN' && form.idLulus) { 
+       form.lulusSign = sigMap.get(form.idLulus)?.sign || ''; form.lulusStamp = sigMap.get(form.idLulus)?.stamp || ''; 
+       form.namaLulus = stafDetails.get(form.idLulus)?.nama || form.idLulus; form.jwtLulus = stafDetails.get(form.idLulus)?.jwt || '';
+     }
+  };
+  myUR.forEach(injectSig); myBDR.forEach(injectSig);
+  return { bdr: myBDR, ur: myUR };
+}
+
+function adminGetPendingBDR(token) {
+  const u = session_(token);
+  const canSokong = checkAccess_(u, 'SOKONG_BDR');
+  const canLulus = checkAccess_(u, 'LULUS_BDR');
+  if (!canSokong && !canLulus) return {sokong:[], lulus:[]};
+  
+  const sh = sheet_('BORANG_BDR'); if(!sh) return {sokong:[], lulus:[]};
+  const rs = rows_(sh, 20);
+  const nameMap = new Map(masterStaff_().map(s => [s.id, s.name]));
+  const isGlobal = u.scope === 'SEMUA' || ['SUPER ADMIN', 'SUPER ADMIN HIDDEN', 'PENGURUSAN'].includes(u.role) || checkAccess_(u, 'ANALISA_WARGA') || canLulus;
+  const myUnitScope = (u.scope && u.scope !== 'SEMUA') ? u.scope : u.unit;
+
+  let sokongList = [], lulusList = [];
+  if (canSokong) {
+    sokongList = rs.filter(r => r[12] === 'MENUNGGU SOKONGAN' && (isGlobal || r[4] === myUnitScope || r[4] === u.unit)).map(r => ({
+      reqId: r[0], tMohon: r[1], name: r[3], unit: r[4], jawatan: r[5], mula: r[7], akhir: r[8], sebab: r[10]
+    }));
+  }
+  if (canLulus) {
+    lulusList = rs.filter(r => r[12] === 'DISOKONG' && r[16] === 'MENUNGGU KELULUSAN' && (isGlobal || r[4] === myUnitScope)).map(r => ({
+      reqId: r[0], tMohon: r[1], name: r[3], unit: r[4], jawatan: r[5], mula: r[7], akhir: r[8], sebab: r[10], ulasanSokong: r[14], namaSokong: nameMap.get(r[13]) || r[13]
+    }));
+  }
+  return { sokong: sokongList, lulus: lulusList };
+}
+
+function adminProcessBDR(token, reqId, type, statusSah, ulasan) {
+  return locked_(()=>{
+  const u = session_(token);
+  const sh = sheet_('BORANG_BDR'), rs = rows_(sh, 20), ix = rs.findIndex(r => r[0] === reqId);
+  if (ix < 0) throw Error('Borang BDR tidak ditemui.');
+  const r = rs[ix];
+  validateDecision_(u,r,"BDR",type,statusSah);
+  
+  if (type === 'SOKONG' && checkAccess_(u, 'SOKONG_BDR')) {
+     r[12] = statusSah; r[13] = u.id; r[14] = String(ulasan||'').trim(); r[15] = new Date().toISOString();
+     const recSh = sheet_('KEBERADAAN'), recRs = rows_(recSh, 6); let curr = r[7];
+     while(curr <= r[8]) {
+       const ixRec = recRs.findIndex(record => record[0] === r[2] && record[1] === curr);
+       if (ixRec >= 0 && recRs[ixRec][2].includes('BDR') && recRs[ixRec][3].includes(reqId)) setRow_(recSh, ixRec+2, [r[2], curr, (statusSah === 'DISOKONG') ? 'BDR (Kelulusan)' : 'LAIN-LAIN', 'Rujuk borang: '+reqId+'; Status: '+statusSah, new Date(), u.id]);
+       curr = addDays_(curr, 1);
+     }
+  } else if (type === 'LULUS' && checkAccess_(u, 'LULUS_BDR')) {
+     r[16] = statusSah; r[17] = u.id; r[18] = String(ulasan||'').trim(); r[19] = new Date().toISOString();
+     const recSh = sheet_('KEBERADAAN'), recRs = rows_(recSh, 6); let curr = r[7];
+     while(curr <= r[8]) {
+       const ixRec = recRs.findIndex(record => record[0] === r[2] && record[1] === curr);
+       if (ixRec >= 0 && recRs[ixRec][2].includes('BDR') && recRs[ixRec][3].includes(reqId)) setRow_(recSh, ixRec+2, [r[2], curr, (statusSah === 'DILULUSKAN') ? 'BDR' : 'LAIN-LAIN', 'Rujuk borang: '+reqId+'; Status akhir: '+statusSah, new Date(), u.id]);
+       curr = addDays_(curr, 1);
+     }
+  } else throw Error('Akses ditolak.');
+  
+  setRow_(sh, ix+2, r);
+  return {ok: true};
+  });
+}
+
+function adminGetPendingUR(token) {
+  const u = session_(token);
+  const canSokong = checkAccess_(u, 'SOKONG_UR');
+  const canLulus = checkAccess_(u, 'LULUS_UR');
+  if (!canSokong && !canLulus) return {sokong:[], lulus:[]};
+  
+  const sh = sheet_('BORANG_UR'); if(!sh) return {sokong:[], lulus:[]};
+  const rs = rows_(sh, 23);
+  const nameMap = new Map(masterStaff_().map(s => [s.id, s.name]));
+  const isGlobal = u.scope === 'SEMUA' || ['SUPER ADMIN', 'SUPER ADMIN HIDDEN', 'PENGURUSAN'].includes(u.role) || checkAccess_(u, 'ANALISA_WARGA') || canLulus;
+  const myUnitScope = (u.scope && u.scope !== 'SEMUA') ? u.scope : u.unit;
+  
+  let sokongList = [], lulusList = [];
+  if (canSokong) {
+    sokongList = rs.filter(r => r[15] === 'MENUNGGU SOKONGAN' && (isGlobal || r[4] === myUnitScope || r[4] === u.unit)).map(r => ({
+      reqId: r[0], tMohon: r[1], name: r[3], unit: r[4], jawatan: r[5], perihal: r[7], mula: r[8], akhir: r[9], lokasi: r[10]
+    }));
+  }
+  if (canLulus) {
+    lulusList = rs.filter(r => r[15] === 'DISOKONG' && r[19] === 'MENUNGGU KELULUSAN' && (isGlobal || r[4] === myUnitScope)).map(r => ({
+      reqId: r[0], tMohon: r[1], name: r[3], unit: r[4], jawatan: r[5], perihal: r[7], mula: r[8], akhir: r[9], lokasi: r[10], ulasanSokong: r[17], namaSokong: nameMap.get(r[16]) || r[16]
+    }));
+  }
+  return { sokong: sokongList, lulus: lulusList };
+}
+
+function adminProcessUR(token, reqId, type, statusSah, ulasan) {
+  return locked_(()=>{
+  const u = session_(token);
+  const sh = sheet_('BORANG_UR'), rs = rows_(sh, 23), ix = rs.findIndex(r => r[0] === reqId);
+  if (ix < 0) throw Error('Borang UR tidak ditemui.');
+  const r = rs[ix];
+  validateDecision_(u,r,"UR",type,statusSah);
+  
+  if (type === 'SOKONG' && checkAccess_(u, 'SOKONG_UR')) {
+     r[15] = statusSah; r[16] = u.id; r[17] = String(ulasan||'').trim(); r[18] = new Date().toISOString();
+     const recSh = sheet_('KEBERADAAN'), recRs = rows_(recSh, 6); let curr = r[8];
+     while(curr <= r[9]) {
+       const ixRec = recRs.findIndex(record => record[0] === r[2] && record[1] === curr);
+       if (ixRec >= 0 && recRs[ixRec][2].includes('UR') && recRs[ixRec][3].includes(reqId)) setRow_(recSh, ixRec+2, [r[2], curr, (statusSah === 'DISOKONG') ? 'UR (Kelulusan)' : 'LAIN-LAIN', 'Rujuk borang: '+reqId+'; Status: '+statusSah, new Date(), u.id]);
+       curr = addDays_(curr, 1);
+     }
+  } else if (type === 'LULUS' && checkAccess_(u, 'LULUS_UR')) {
+     r[19] = statusSah; r[20] = u.id; r[21] = String(ulasan||'').trim(); r[22] = new Date().toISOString();
+     const recSh = sheet_('KEBERADAAN'), recRs = rows_(recSh, 6); let curr = r[8];
+     while(curr <= r[9]) {
+       const ixRec = recRs.findIndex(record => record[0] === r[2] && record[1] === curr);
+       if (ixRec >= 0 && recRs[ixRec][2].includes('UR') && recRs[ixRec][3].includes(reqId)) setRow_(recSh, ixRec+2, [r[2], curr, (statusSah === 'DILULUSKAN') ? 'UR' : 'LAIN-LAIN', 'Rujuk borang: '+reqId+'; Status akhir: '+statusSah, new Date(), u.id]);
+       curr = addDays_(curr, 1);
+     }
+  } else throw Error('Akses ditolak.');
+  
+  setRow_(sh, ix+2, r);
+  return {ok: true};
+  });
+}
+
+function adminList(token){
+  const u=session_(token);
+  const usr=rows_(sheet_('PENGGUNA'),13);
+  const userMap = new Map();
+  usr.forEach(r => { if (r[0]) userMap.set(String(r[0]).trim().toUpperCase(), r); });
+
+  let rawStaf = masterStaff_().map(p=>[p.id,p.name,p.unit,p.jawatan,p.gred,p.kategori,'AKTIF']);
+  
+  let list = rawStaf.map(r=>{
+    const x = userMap.get(String(r[0]).trim().toUpperCase());
+    return { id:r[0], name:r[1], unit:r[2], jawatan:r[3], role:x?x[1]:'BELUM DAFTAR', state:x?x[3]:'BELUM DAFTAR', scope: x?x[2]:r[2], modules: x?x[6]:'' };
+  });
+  if(!['SUPER ADMIN', 'SUPER ADMIN HIDDEN'].includes(u.role) && !checkAccess_(u, 'ROLE')) {
+    if (u.scope && u.scope !== 'SEMUA') list = list.filter(p => p.unit === u.scope || p.unit === u.unit);
+  }
+  if(!checkAccess_(u,'ROLE')&&!checkAccess_(u,'RESET')&&!checkAccess_(u,'BULK'))throw Error('Akses ditolak.');
+  list=list.filter(p=>adminScope_(u,p));
+  return {list: list, units:[...new Set(list.map(p=>p.unit))].sort()};
+}
+
+// SIMPAN PERANAN & HAPUSKAN BARIS PENDUA SUPAYA TETAPAN SUPER ADMIN SENTIASA TEPAT
+function adminChangeUserRole(token, targetId, newRole, newScope, modules) {
+  const u = session_(token);
+  requireAdminTarget_(u,targetId);
+  if (!checkAccess_(u, 'ROLE')) throw Error('Akses ditolak.');
+  if(!u.role.includes('SUPER ADMIN'))throw Error('Hanya Super Admin boleh melantik peranan dan modul.');
+  if(!['STAF','ADMIN','KETUA JABATAN','KETUA UNIT','PENGURUSAN','SUPER ADMIN'].includes(newRole))throw Error('Peranan tidak sah.');
+  const cleanId = norm_(targetId).toUpperCase();
+  const sh = sheet_('PENGGUNA');
+  const rs = rows_(sh, Math.max(13,sh.getLastColumn()));
+  
+  let matchingRows = [];
+  rs.forEach((r, idx) => {
+    if (String(r[0]).trim().toUpperCase() === cleanId) matchingRows.push(idx + 2);
+  });
+
+  if (matchingRows.length === 0) {
+    const st = masterStaff_().find(p => p.id === cleanId);
+    if (!st) throw Error('Staf tidak ditemui.');
+    const salt=uuid_();
+    sh.appendRow([cleanId, norm_(newRole), norm_(newScope), 'AKTIF', salt, hash_('123456',salt), norm_(modules), '', '', 0, '', 0, 'YA']);
+    return { ok: true };
+  }
+
+  // Kemas kini baris pertama dan padam sebarang baris pendua lama jika ada
+  const keepRowIdx = matchingRows[matchingRows.length-1];
+  const r = rs[keepRowIdx - 2];
+  r[1] = norm_(newRole);
+  r[2] = norm_(newScope);
+  r[3] = r[3] || 'AKTIF';
+  r[6] = norm_(modules);
+  setRow_(sh, keepRowIdx, r);
+
+
+  return { ok: true };
+}
+
+function adminPendingResets(token){
+ const u=session_(token);if(!checkAccess_(u,'RESET'))return [];
+ const names=new Map(masterStaff_().map(p=>[p.id,p]));
+ return rows_(sheet_('PERMOHONAN'),7).filter(r=>r[4]==='MENUNGGU'&&names.has(r[0])&&adminScope_(u,names.get(r[0]))).map(r=>({id:r[0],name:names.get(r[0]).name,unit:names.get(r[0]).unit}));
+}
+
+function adminApproveResets(token,ids){
+ return locked_(()=>{
+  const u=session_(token);if(!checkAccess_(u,'RESET'))throw Error('Akses ditolak.');
+  if(!Array.isArray(ids)||ids.length>200)throw Error('Senarai tidak sah.');
+  const sh=sheet_('PERMOHONAN'),rs=rows_(sh,7);
+  ids.forEach(id=>{
+   requireAdminTarget_(u,id);const o=userRow_(id);if(!o.row)throw Error('Akaun tidak ditemui.');
+   if(!rs.some(r=>r[0]===id && r[4]==='MENUNGGU'))return;
+   resetAccount_(o);
+   rs.forEach((r,i)=>{if(r[0]===id&&r[4]==='MENUNGGU'){r[4]='DILULUSKAN';r[5]=u.id;r[6]=new Date().toISOString();setRow_(sh,i+2,r);}});
+  });return {ok:true};
+ });
+}
+
+function adminResetPin(token,id){
+ return locked_(()=>{
+  const u=session_(token);if(!checkAccess_(u,'ROLE')&&!checkAccess_(u,'RESET'))throw Error('Akses ditolak.');
+  requireAdminTarget_(u,id);const o=userRow_(id);if(!o.row)throw Error('Aktifkan akaun dahulu.');
+  resetAccount_(o);return {ok:true};
+ });
+}
+
+function adminSuspend(token,id){
+  const u=session_(token);if(!checkAccess_(u, 'ROLE'))throw Error('Akses ditolak.');
+  requireAdminTarget_(u,id);
+  const o=userRow_(norm_(id));if(!o.row)throw Error('Akaun belum didaftarkan.');
+  o.sh.getRange(o.idx,4).setValue('DIGANTUNG');return {ok:true};
+}
+
+function adminSoftDelete(token, targetId) {
+  const u = session_(token);if(!checkAccess_(u, 'ROLE'))throw Error('Akses ditolak.');
+  requireAdminTarget_(u,targetId);
+  const obj = userRow_(targetId);if (!obj.row) throw Error('Akaun tidak wujud.');
+  obj.sh.getRange(obj.idx, 4).setValue('DIBUANG');return { ok: true };
+}
+
+function adminGetStaffDB(token) {
+  const u = session_(token);if (!checkAccess_(u, 'DB')) return [];
+  let list = masterStaff_().map(p => ({...p, status: 'AKTIF'}));
+  try {
+    const sh = sheet_('STAF');
+    if (sh && sh.getLastRow() >= 2) {
+      const dbList = rows_(sh, 7).map(r => ({ id: r[0], name: r[1], unit: r[2], jawatan: r[3], gred: r[4], kategori: r[5], status: r[6] || 'AKTIF' }));
+      if (dbList.length > 0) list = dbList;
+    }
+  } catch(e) {}
+  if (!u.role.includes('SUPER ADMIN') && u.scope !== 'SEMUA') list = list.filter(p => p.unit === u.scope);
+  return list;
+}
+
+function adminSaveStaffDB(token, payload) {
+  const u = session_(token);if (!checkAccess_(u, 'DB')) throw Error('Akses ditolak.');
+  if(!u.role.includes('SUPER ADMIN') && u.scope!=='SEMUA')throw Error('Pengurusan database memerlukan skop SEMUA.');
+  const sh = sheet_('STAF'), rs = rows_(sh, 7), ix = rs.findIndex(r => r[0] === payload.id);
+  if(!payload.id || !payload.name || !payload.unit)throw Error('ID, nama dan unit wajib diisi.');
+  const row = [payload.id, payload.name, payload.unit, payload.jawatan, payload.gred, payload.kategori, payload.status || 'AKTIF',payload.gelaran||''].map(safe_);
+  if (ix === -1) sh.appendRow(row); else setRow_(sh, ix+2, row);
+  return { ok: true };
+}
+
+function adminDropStaffDB(token, id) {
+  const u = session_(token);if (!checkAccess_(u, 'DB')) throw Error('Akses ditolak.');
+  if(!u.role.includes('SUPER ADMIN') && u.scope!=='SEMUA')throw Error('Pengurusan database memerlukan skop SEMUA.');
+  const sh = sheet_('STAF'), rs = rows_(sh, 7), ix = rs.findIndex(r => r[0] === id);
+  if (ix >= 0) {
+    sh.getRange(ix + 2, 7).setValue('GUGUR');
+    const o = userRow_(id);
+    if (o.row) o.sh.getRange(o.idx, 4).setValue('DIBUANG');
+  }
+  return { ok: true };
+}
+
+function adminUploadCSVDB(token, staffArray) {
+  const u = session_(token);if (!checkAccess_(u, 'DB')) throw Error('Akses ditolak.');
+  if(!u.role.includes('SUPER ADMIN') && u.scope!=='SEMUA')throw Error('Pengurusan database memerlukan skop SEMUA.');
+  const sh = sheet_('STAF'), existingMap = new Map(rows_(sh, 7).map((r, i) => [r[0], i + 2]));
+  const newRows = []; let updated = 0, added = 0;
+  staffArray.forEach(p => {
+    if (!p[0] || !p[1]) return; 
+    const row = [p[0], p[1], p[2] || '', p[3] || '', p[4] || '', p[5] || '', 'AKTIF'];
+    if (existingMap.has(p[0])) { setRow_(sh, existingMap.get(p[0]), row); updated++; } 
+    else { newRows.push(row); added++; }
+  });
+  if (newRows.length > 0) {
+    if (sh.getMaxColumns() < 7) sh.insertColumnsAfter(sh.getMaxColumns(), 7 - sh.getMaxColumns());
+    sh.getRange(sh.getLastRow() + 1, 1, newRows.length, 7).setValues(newRows);
+  }
+  return { added, updated };
+}
+
+function publicStaffDirectory(){
+  return masterStaff_().map(p => ({id: p.id, name: p.name, unit: p.unit}));
+}
+
+function adminBulkActivate(token,unit){
+ return locked_(()=>{
+  const u=session_(token);if(!checkAccess_(u,'BULK'))throw Error('Akses ditolak.');
+  const sh=sheet_('PENGGUNA'),existing=new Set(rows_(sh,13).map(r=>r[0]));let created=0;
+  masterStaff_().filter(p=>(!unit||p.unit===unit)&&adminScope_(u,p)).forEach(p=>{
+   if(existing.has(p.id))return;const salt=uuid_();sh.appendRow([p.id,'STAF',p.unit,'AKTIF',salt,hash_('123456',salt),'','','',0,'',0,'YA']);created++;
+  });return {created};
+ });
+}
+
+function getCorporateTheme(){
+  const val=PropertiesService.getScriptProperties().getProperty('IPGK_CORPORATE_THEME');
+  return CORPORATE_THEMES_V171.includes(val)?val:'navy';
+}
+function adminSetCorporateTheme(token,theme){
+  const user=session_(token);if(!['SUPER ADMIN HIDDEN', 'SUPER ADMIN'].includes(user.role)) throw new Error('Hanya Super Admin boleh mengubah tema.');
+  theme=String(theme||'').trim();
+  PropertiesService.getScriptProperties().setProperty('IPGK_CORPORATE_THEME',theme);
+  return {ok:true,theme:theme};
+}
+
+function locked_(fn){const l=LockService.getScriptLock();l.waitLock(20000);try{return fn();}finally{l.releaseLock();}}
+function assertReady_(){if(PropertiesService.getScriptProperties().getProperty('EMANDAT_SCHEMA')!=='6.1')throw Error('Pemasangan belum lengkap. Jalankan setupEMandat_ dalam editor.');}
+function masterStaff_(){return rows_(sheet_('STAF'),8).filter(r=>r[0]&&r[1]&&r[6]!=='GUGUR').map(r=>({id:r[0],name:r[1],unit:r[2],jawatan:r[3],gred:r[4],kategori:r[5],gelaran:r[7]}));}
+function adminScope_(u,p){return u.role.includes('SUPER ADMIN')||u.scope==='SEMUA'||p.unit===(u.scope||u.unit);}
+function requireAdminTarget_(u,id){
+ const p=masterStaff_().find(p=>p.id===id),o=userRow_(id);
+ if(!p || !adminScope_(u,p))throw Error('Staf di luar skop pentadbiran.');
+ if(!u.role.includes('SUPER ADMIN') && o.row && ['SUPER ADMIN','PENGURUSAN'].includes(o.row[1]))throw Error('Akaun ini hanya boleh diurus oleh Super Admin.');
+}
+function resetAccount_(o){
+ o.row[4]=uuid_();o.row[5]=hash_('123456',o.row[4]);o.row[3]='AKTIF';o.row[9]=0;o.row[10]='';o.row[11]=Number(o.row[11]||0)+1;o.row[12]='YA';
+ setRow_(o.sh,o.idx,o.row);
+}
+function validDay_(x){const s=norm_(x);if(!/^\d{4}-\d{2}-\d{2}$/.test(s)||isNaN(Date.parse(s+'T12:00:00Z'))||new Date(s+'T12:00:00Z').toISOString().slice(0,10)!==s)throw Error('Tarikh tidak sah.');return s;}
+function canEditRecord_(u,id){
+ const p=masterStaff_().find(p=>p.id===id);if(!p)throw Error('Staf tidak ditemui.');
+ if(id===u.id)return;
+ if(!['SUPER ADMIN','PENGURUSAN','ADMIN','KETUA JABATAN','KETUA UNIT'].includes(u.role)||!adminScope_(u,p))throw Error('Tiada kebenaran mengubah rekod staf ini.');
+}
+function upsertRecord_(id,date,status,note,actor){const sh=sheet_('KEBERADAAN'),rs=rows_(sh,6),ix=rs.findIndex(r=>r[0]===id&&r[1]===date),v=[id,date,status,note,new Date(),actor];if(ix<0)sh.appendRow(v);else setRow_(sh,ix+2,v);}
+function validateForm_(u,p,kind){
+ if(!p||!staff_(u.id).length)throw Error('Profil staf tidak sah.');
+ p.mula=validDay_(p.mula);p.akhir=validDay_(p.akhir);
+ if(p.akhir<p.mula||(Date.parse(p.akhir)-Date.parse(p.mula))/86400000>366)throw Error('Julat tarikh tidak sah atau melebihi 366 hari.');
+ if(!norm_(kind==='BDR'?p.sebab:p.perihal))throw Error('Sebab/perihal wajib diisi.');
+ if(![0,1,2,3,4,5,6].some(i=>{const d=addDays_(p.mula,i);return d<=p.akhir&&![0,6].includes(parseDay_(d).getUTCDay());}))throw Error('Julat mesti mengandungi hari bekerja.');
+ const existing=rows_(sheet_('KEBERADAAN'),6);
+ if(existing.some(r=>r[0]===u.id&&r[1]>=p.mula&&r[1]<=p.akhir))throw Error('Rekod sudah wujud dalam julat ini. Semak atau padam rekod hari berkenaan dahulu. Borang lama kekal untuk audit.');
+ ['BORANG_BDR','BORANG_UR'].forEach(name=>{const b=name==='BORANG_BDR';if(rows_(sheet_(name),b?20:23).some(r=>r[2]===u.id&&r[b?7:8]<=p.akhir&&r[b?8:9]>=p.mula&&r[b?12:15]!=='TIDAK DISOKONG'&&r[b?16:19]!=='TIDAK DILULUSKAN'))throw Error('Borang bertindih masih aktif. Hubungi pentadbir untuk pembetulan.');});
+ Object.keys(p).forEach(k=>{if(typeof p[k]==='string')p[k]=safe_(p[k]);});
+}
+function validateDecision_(u,r,kind,type,status){
+ const b=kind==='BDR',s=b?12:15,l=b?16:19;
+ if(!['SOKONG','LULUS'].includes(type)||!checkAccess_(u,type+'_'+kind))throw Error('Akses ditolak.');
+ if(!adminScope_(u,{unit:r[4]}))throw Error('Borang di luar skop.');
+ if(u.id===r[2])throw Error('Tidak boleh mengesahkan permohonan sendiri.');
+ if(type==='SOKONG'){
+  if(r[s]!=='MENUNGGU SOKONGAN'||!['DISOKONG','TIDAK DISOKONG'].includes(status))throw Error('Peringkat sokongan tidak sah atau sudah diproses.');
+ }else{
+  if(r[s]!=='DISOKONG'||r[l]!=='MENUNGGU KELULUSAN'||!['DILULUSKAN','TIDAK DILULUSKAN'].includes(status))throw Error('Borang belum disokong atau sudah diproses.');
+  if(r[s+1]===u.id)throw Error('Pelulus perlu berbeza daripada penyokong.');
+ }
+}
+
+// OWNER ONLY: functions ending in _ cannot be invoked through google.script.run.
+function setupEMandat_(){
+ return locked_(()=>{
+  const ss=ss_(),props=PropertiesService.getScriptProperties();
+  const backup=[];
+  const userHeads=USER_HEAD;
+  const bdrHeads=['REQ_ID','TARIKH MOHON','ID STAF','NAMA','UNIT','JAWATAN','GRED','TARIKH MULA','TARIKH AKHIR','NO TELEFON','SEBAB/TUJUAN','ALAMAT BDR','STATUS SOKONGAN','ID SOKONG','ULASAN SOKONG','TARIKH SOKONG','STATUS KELULUSAN','ID LULUS','ULASAN LULUS','TARIKH LULUS'];
+  const urHeads=['REQ_ID','TARIKH MOHON','ID STAF','NAMA','UNIT','JAWATAN','GRED','PERIHAL TUGAS','MULA','AKHIR','LOKASI','TEMPAT LUAR','RUJUKAN','TARIKH SURAT','DIMINITKAN','STATUS SOKONGAN','ID SOKONG','ULASAN SOKONG','TARIKH SOKONG','STATUS LULUS','ID LULUS','ULASAN LULUS','TARIKH LULUS'];
+  const required={STAF:['ID','NAMA','JABATAN / UNIT','JAWATAN','GRED','KATEGORI','STATUS STAF','GELARAN'],KEBERADAAN:['ID STAF','TARIKH','STATUS','CATATAN','KEMAS KINI','DIKEMAS KINI OLEH'],PENGGUNA:userHeads,BORANG_BDR:bdrHeads,BORANG_UR:urHeads,PERMOHONAN:['ID STAF','NAMA','JABATAN UNIT','DIPOHON PADA','STATUS PERMOHONAN','DIPROSES OLEH','DIPROSES PADA']};
+  // Preflight all input schemas before writing anything.
+  Object.keys(required).forEach(name=>{
+   const sh=ss.getSheetByName(name);if(!sh)throw Error('Tab wajib tiada: '+name+'. Gunakan salinan database asal.');
+   const h=sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(norm_);
+   const minimum=name==='PENGGUNA'?['ID STAF','PERANAN','SKOP','STATUS','SALT PIN','HASH PIN']:required[name].slice(0,name==='STAF'?6:name==='BORANG_BDR'?12:required[name].length);
+   minimum.forEach(x=>{if(!h.includes(x))throw Error('Lajur '+x+' tiada pada '+name);});
+  });
+  Object.keys(required).forEach(name=>{
+   const sh=ss.getSheetByName(name),old=sh.getDataRange().getValues(),h=old[0].map(norm_),wanted=required[name];
+   if(wanted.every((x,i)=>h[i]===x))return;
+   const stamp=Utilities.formatDate(new Date(),'Asia/Kuala_Lumpur','yyMMdd_HHmmss');
+   const copy=sh.copyTo(ss).setName(('BU_'+name+'_'+stamp+'_'+uuid_().slice(0,4)).slice(0,99));backup.push(copy.getName());
+   const extra=h.filter(x=>x&&!wanted.includes(x)),head=wanted.concat(extra);
+   const data=old.slice(1).filter(r=>r[0]).map(r=>{
+    const v=head.map(x=>h.includes(x)?r[h.indexOf(x)]:'');
+    if(name==='PENGGUNA'){
+     v[6]=h.includes('MODUL_AKSES')?v[6]:'';v[7]=h.includes('SIGNATURE')?v[7]:'';v[8]=h.includes('STAMP')?v[8]:'';
+     v[11]=h.includes('RESET_COUNT')?v[11]:0;
+     if(!v[5]||v[5]==='BYPASS'){v[4]=uuid_();v[5]=hash_('123456',v[4]);v[12]='YA';}
+     if(v[3]==='MENUNGGU PIN')v[12]='YA';
+    }
+    if(name==='BORANG_BDR'&&!h.includes('STATUS SOKONGAN')){
+     const legacy=norm_(r[h.indexOf('STATUS KELULUSAN')]);
+     if(['LULUS','DILULUSKAN'].includes(legacy)){v[12]='LEGASI';v[16]='DILULUSKAN';}
+     else if(['TIDAK DISOKONG','DITOLAK','TIDAK DILULUSKAN'].includes(legacy)){v[12]='TIDAK DISOKONG';v[16]='TIDAK DILULUSKAN';}
+     else if(legacy==='DISOKONG'){v[12]='DISOKONG';v[16]='MENUNGGU KELULUSAN';}
+     else {v[12]='MENUNGGU SOKONGAN';v[16]='MENUNGGU KELULUSAN';}
+     // Retain old approver name/position/comment in extra legacy columns; never invent a staff ID or signature.
+     if(v[16]==='DILULUSKAN'){v[18]=h.includes('ULASAN PENGESAH')?r[h.indexOf('ULASAN PENGESAH')]:'';v[19]=h.includes('TARIKH SAH')?r[h.indexOf('TARIKH SAH')]:'';}
+    }return v;
+   });
+   if(sh.getMaxColumns()<head.length)sh.insertColumnsAfter(sh.getMaxColumns(),head.length-sh.getMaxColumns());
+   sh.clearContents();sh.getRange(1,1,1,head.length).setValues([head]);
+   if(data.length)sh.getRange(2,1,data.length,head.length).setValues(data);
+  });
+  props.setProperty('EMANDAT_SCHEMA','6.1');
+  Logger.log('Persediaan selesai. Backup: '+backup.join(', '));
+  return {ok:true,backup};
+ });
+}
+// Optional owner recovery: set both Script Properties, then run once from editor.
+function pulihAdminEMandat_(){
+ return locked_(()=>{
+  assertReady_();const props=PropertiesService.getScriptProperties(),id=norm_(props.getProperty('EMANDAT_ADMIN_ID')).toUpperCase(),pass=props.getProperty('EMANDAT_ADMIN_PASSWORD');
+  if(!id||!pass||pass.length<12)throw Error('Tetapkan EMANDAT_ADMIN_ID (ID staf) dan EMANDAT_ADMIN_PASSWORD (minimum 12 aksara) dalam Script Properties.');
+  if(!staff_(id).length)throw Error('ID staf tidak ditemui.');
+  const o=userRow_(id);if(!o.row)throw Error('Akaun tidak ditemui.');
+  o.row[1]='SUPER ADMIN';o.row[2]='SEMUA';o.row[3]='AKTIF';o.row[4]=uuid_();o.row[5]=hash_(pass,o.row[4]);o.row[6]='SEMUA';o.row[9]=0;o.row[10]='';o.row[12]='TIDAK';setRow_(o.sh,o.idx,o.row);
+  props.deleteProperty('EMANDAT_ADMIN_PASSWORD');Logger.log('Akaun pentadbir dipulihkan: '+id);return {ok:true};
+ });
+}
+function SetupEMandat() {
+  const pengguna = Session.getActiveUser().getEmail();
+  const pemilik = Session.getEffectiveUser().getEmail();
+
+  if (!pengguna || pengguna !== pemilik) {
+    throw new Error('Jalankan melalui editor menggunakan akaun pemilik.');
+  }
+
+  return setupEMandat_();
+}
+function jalankanPemulihanAdmin() {
+  const pengguna = Session.getActiveUser().getEmail();
+  const pemilik = Session.getEffectiveUser().getEmail();
+
+  if (!pengguna || pengguna !== pemilik) {
+    throw new Error('Jalankan melalui editor menggunakan akaun pemilik.');
+  }
+
+  return pulihAdminEMandat_();
+}
